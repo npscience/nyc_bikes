@@ -1,4 +1,4 @@
-# Meteorites
+# NYC Citibike
  
 Coursework and evidence from **NYC Citi bikes project** for SQA PDA in Data Science.
  
