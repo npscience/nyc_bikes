@@ -1,0 +1,847 @@
+---
+title: "Exploration & playground"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Library calls
+
+```{r}
+library(tidyverse)
+library(tsibbledata)
+library(tsibble)
+library(lubridate)
+library(leaflet)
+library(forcats)
+library(infer)
+library(slider)
+```
+_Note: lubridate masks tsibble::interval and base::date/intersect/setdiff/union_
+
+### theme set up
+
+```{r}
+# set up color palette for citibank and lyft
+lyft_pink <- "#FF00BF"
+citibank_darkblue <- "#003A72" 
+citibank_red <- "#DB230B"
+```
+
+
+### Data types
+
+* start_time and stop_time are <dttm> date time format - we can use these directly to extract weekdays, months, years, etc
+* start_station and stop_station are <fctr> factor format - they include the id of the station locations
+* {start/end}_{lat/long} are <dbl> format for mapping
+* birth_year is <dbl> as a numeric - convert to datetime to calculate age at time of start_time
+* gender is <fctr> and includes: Male, Female, Unknown
+
+```{r}
+nyc_bikes %>% 
+  distinct(gender)
+```
+
+## classic or electric bike?
+
+Note: no variable for bike type (classic or electric), which seems important for analysing how to increase ride business. Checking the helpfile source (https://citibikenyc.com/system-data) there is potentially newer data available for download from this website, which includes "rideable type".
+
+**IF TIME: consider including this as an extra / easter egg at end of presentation (any other insights)**
+
+# Data cleaning/wrangling
+
+
+## Convert start_time into date, year, month, etc
+
+```{r}
+head(nyc_bikes)
+```
+
+start_time and stop_time are already in ISO ... format (<S3: POSIXct> class) so do not need to be converted. Also, this is all about bikes in NYC so I am not converting timezone because it won't affect any calculated data.
+
+However, we can extract the year, month, etc from these variables, to enable analysis of hires over time as well as calculate rider age at time of hire.
+
+```{r cleaning-step1}
+nyc_bikes_wrangled <- nyc_bikes %>% 
+  mutate(
+    # extract elements from start_time
+    start_year = year(start_time),
+    start_month = month(start_time, label = TRUE, abbr = TRUE),
+    start_day = day(start_time),
+    start_weekday = wday(start_time, label = TRUE, abbr = TRUE),
+    start_hour = hour(start_time),
+    start_minute = minute(start_time),
+    # make start dates and times
+    start_date = make_date(year = start_year, month = start_month, day = start_day),
+    start_timestamp = hm(str_c(as.character(start_hour),":",as.character(start_minute))),
+    # extract same elements from stop_time
+    stop_year = year(stop_time),
+    stop_month = month(stop_time, label = TRUE, abbr = TRUE),
+    stop_day = day(stop_time),
+    stop_weekday = wday(stop_time, label = TRUE, abbr = TRUE),
+    stop_hour = hour(stop_time),
+    stop_minute = minute(stop_time),
+    # make stop dates and times
+    stop_date = make_date(year = stop_year, month = stop_month, day = stop_day),
+    stop_timestamp = hm(str_c(as.character(stop_hour),":",as.character(stop_minute)))
+    ) %>%
+  # calculate additional variables
+  mutate(
+    # calculate ride duration in different units (hours, mins)
+    ride_duration_period = as.period(stop_time - start_time),
+    ride_duration_hours = as.numeric(ride_duration_period, "hours"),
+    ride_duration_mins = as.numeric(ride_duration_period, "minutes"),
+    # calculate rider age in years
+    rider_age = start_year - birth_year
+    )
+
+head(nyc_bikes_wrangled)
+```
+
+
+## Make a tibble for summary stats (not time series)
+
+```{r}
+nyc_bikes_tibble <- as.tibble(nyc_bikes_wrangled)
+```
+
+### check NAs again
+```{r}
+nyc_bikes_tibble %>%
+  summarise(across(
+    .cols = everything(),
+    .fns = ~ sum(is.na(.x))
+  )) 
+```
+
+No NAs in summary data tibble.
+
+### year of data is 2018
+
+```{r}
+# summary stats for overall df
+nyc_bikes_tibble %>% 
+  distinct(start_year)
+```
+All the data is from 2018.
+
+### inspect demographic data
+
+```{r}
+# overall summary counts for user demographics
+
+# (i) gender
+nyc_bikes_tibble %>% 
+  summarise(count = n(), .by = gender)
+
+# (ii) age
+nyc_bikes_tibble %>% 
+  summarise(count = n(), .by = rider_age) %>% 
+  arrange(rider_age)
+
+nyc_bikes_tibble %>% 
+  ggplot() +
+  geom_histogram(aes(x = rider_age), colour = "white", bins = 50)
+
+# is age 49 peak gender unknown?
+nyc_bikes_tibble %>% 
+  filter(rider_age == 49) %>% 
+  summarise(count = n(), .by = gender)
+
+# most of the 49-yo users have gender unknown - this is fishy, recode these rows to NAs for user demographics
+```
+
+Most of the 49-yo users have gender unknown - this is fishy, could be not real, so recode these rows to NA for age (other user demographics is fine, can filter out gender unknown for proportions and rider type still looks valid)
+
+### inspect ride data
+
+```{r}
+## some very long durations - consider these relock failures?
+nyc_bikes_tibble %>% 
+  filter(ride_duration_mins > 100) %>% 
+  select(ride_duration_mins, type, birth_year, gender, rider_age,
+         start_time, stop_time, start_station, end_station) %>% 
+  arrange(desc(ride_duration_mins))
+  
+# recode as NA any ride duration mins > 180 (3 hours) -- recodes 10 values
+nyc_bikes_tibble %>% 
+  filter(ride_duration_mins > 180) %>% 
+  select(ride_duration_mins, type, birth_year, gender, rider_age,
+         start_time, stop_time, start_station, end_station) %>% 
+  arrange(desc(ride_duration_mins))
+```
+
+### clean data
+
+```{r cleaning-report}
+nyc_bikes_clean <- nyc_bikes_wrangled %>% 
+  mutate(
+        # (NOT USED) recode age to NA for 243 rows where age is 49 & gender is unknown
+        # because this is an unusual peak in our age frequency data, suspect not real
+        # rider_age = if_else(
+        #                 rider_age == 49 & gender == "Unknown",
+        #                 NA_integer_,
+        #                 rider_age),
+        # # recode riders over 100 to NA, 2 values of 130 and 131
+        rider_age = if_else(rider_age > 100, NA_integer_, rider_age),
+        # recode ride duration to NA if over 180 minutes
+        # recodes 10 values, suspect not locked at a station at end of individual ride
+        ride_duration_mins = if_else(
+                        ride_duration_mins>180,
+                        NA_integer_,
+                        ride_duration_mins))
+```
+
+
+```{r cleaning-step2}
+# recode age 49 to NA if gender unknown
+nyc_bikes_summary <- nyc_bikes_tibble %>% 
+  mutate(rider_age = if_else(
+    rider_age == 49 & gender == "Unknown",
+    NA_integer_,
+    rider_age))
+
+# recode as NA any ride duration mins > 180 (3 hours) -- recodes 10 values
+nyc_bikes_tibble %>% 
+  mutate(ride_duration_mins = if_else(
+                                ride_duration_mins>180,
+                                NA_integer_,
+                                ride_duration_mins)) #%>% 
+  # filter(ride_duration_mins > 120) %>% 
+  # select(ride_duration_mins) # all > 180 have gone
+```
+
+
+# Insight Qs
+
+Homework Qs:
+
+1. [x] What is the pattern of bike hires over time (e.g. within a year, month, week, or day)?
+2. [ ] Do bike hire patterns differ between bike rider demographics? (e.g. gender, type of trip, age)
+3. [x] What is the geographical spread of the start points of bike hires?
+4. [ ] Optional: Can you predict bike use over the next couple of months? (This is based on the flipped time series forecasting lesson)
+5. [ ] Any other insights?
+
+Other Qs:
+
+Where do Citi Bikers ride? When do they ride? How far do they go? Which stations are most popular? What days of the week are most rides taken on? (source: https://citibikenyc.com/system-data)
+
+
+For every visualisation you create, consider whether and how it can provide actionable insights to the business (in this case NYC Citi Bike, a bike share operator) and how it relates to key performance indicators (in this case the overall objective is to increase bike hires). Also, remember to include a description and interpretation of each plot so as to explain the context and insights.
+
+
+
+## 1. Hire patterns over time
+
+For ts, use `nyc_bikes_clean`
+
+```{r}
+class(nyc_bikes_clean)
+```
+
+```{r}
+colnames(nyc_bikes_clean)
+```
+
+### all hires (start_date)
+
+```{r}
+nyc_bikes_clean %>%
+  index_by(start_time) %>% 
+  summarise(freq = n()) %>% 
+  ggplot() + 
+  geom_col(aes(x = start_time, y = freq))
+```
+
+
+### month
+
+```{r}
+nyc_bikes_clean %>%
+  index_by(start_month) %>% 
+  summarise(freq = n()) %>% 
+  ggplot() + 
+  geom_col(aes(x = start_month, y = freq))
+```
+August and July are most popular months, for both customers and subscribers:
+
+#### month ~ type
+
+```{r}
+nyc_bikes_summary %>% 
+  ggplot() + 
+  aes(x = start_month, fill = type) +
+  geom_histogram(stat = "count", position = "dodge")
+```
+
+Potentially target visitors in summer <- get day passes for tourists?
+
+Look at visitor start locations, stop locations, durations at different times of year to hone in on this.
+
+### weekday
+
+```{r}
+nyc_bikes_clean %>%
+  index_by(start_weekday) %>% 
+  summarise(freq = n()) %>% 
+  ggplot() + 
+  geom_col(aes(x = start_weekday, y = freq))
+```
+#### weekday ~ type
+
+```{r}
+nyc_bikes_summary %>% 
+  ggplot() + 
+  aes(x = start_weekday, y = after_stat("count"), fill = type) +
+  geom_col() +
+  facet_wrap(~type, ncol=1)
+```
+
+Customers tend to use bikes more on weekends, whereas subscribers use them during the working week (Monday - Friday)
+
+### day (date)
+
+```{r}
+nyc_bikes_clean %>%
+  index_by(start_day) %>% 
+  summarise(freq = n()) %>% 
+  ggplot() + 
+  geom_col(aes(x = start_day, y = freq))
+```
+Just looks like the weekly pattern (higher use on weekdays, driven by subcribers) - but note date number does not correspond to weekday so could be missing this
+
+#### day ~ type
+
+```{r}
+nyc_bikes_summary %>% 
+  ggplot() + 
+  aes(x = start_day, fill = type) +
+  geom_histogram(stat = "count") +
+  facet_wrap(~type, ncol=1)
+```
+
+### start_date
+
+```{r}
+hire_freq_rolling <- nyc_bikes_clean %>% 
+  index_by(start_date) %>% 
+  summarise(freq = n()) %>%
+  mutate(freq_moving_avg = slide_dbl(
+      .x = freq, 
+      .f = ~ mean(., na.rm = TRUE),
+      .before = 14,
+      .after = 14,
+      .complete = TRUE
+    ))
+
+hire_freq_rolling %>%
+  ggplot() + 
+  geom_line(aes(x = start_date, y = freq), colour = citibank_darkblue, alpha = 0.5) +
+  geom_line(aes(x = start_date, y = freq_moving_avg), colour = lyft_pink, size = 2)
+```
+
+### start_hour
+
+start_timestamp doesn't work
+```{r eval = FALSE}
+nyc_bikes_clean %>%
+  index_by(as.numeric(start_timestamp)) %>% 
+  summarise(freq = n()) %>% 
+  ggplot() + 
+  geom_col(aes(x = start_timestamp, y = freq))
+```
+
+so use hour to show frequency of when ride starts
+
+```{r}
+nyc_bikes_clean %>%
+  index_by(start_hour) %>% 
+  # summarise(freq = n()) %>% 
+  ggplot() + 
+  geom_histogram(aes(x = start_hour, fill = type), bins = 24, colour = "white", line = 0.5)
+  #geom_col(aes(x = start_hour, y = freq))
+```
+Peak usage is at 8-9am and 5-7pm i.e. commuter times
+
+### [ ] drilldown into start hour 
+
+separate into weekdays vs weekends;
+facet by type;
+
+
+### duration 
+
+#### duration (overall)
+
+```{r}
+# ride duration
+## note: cleaning step to recode (10) rides above 180 mins as NA
+
+# data distribution for rides 60 mins or less
+## note cleaning step has recoded 10 values about 180 to NA
+## only 43 values higher than 60 remain
+nyc_bikes_summary %>% 
+  # filter(ride_duration_mins <= 180 & ride_duration_mins > 60) # 43 values
+  filter(ride_duration_mins <= 60) %>% 
+  ggplot(aes(x = ride_duration_mins)) +
+  geom_histogram(bins = 100, colour = "white")
+##  skewed data - test for skewness
+
+nyc_bikes_summary %>% 
+  filter(ride_duration_mins <= 60) %>% 
+  ggplot(aes(x = ride_duration_mins)) +
+  geom_boxplot()
+
+# test for skewness
+nyc_bikes_summary %>% 
+  filter(ride_duration_mins <= 60) %>% 
+  pull(ride_duration_mins) %>% 
+  e1071::skewness(ride_duration_mins, type = 2)
+# skewness: 2.813439
+# moderately positively (right) skewed
+
+# 5 number summary
+nyc_bikes_summary %>% 
+  filter(ride_duration_mins <= 60) %>% 
+  select(ride_duration_mins) %>% 
+  summary()
+
+# ride_duration_mins
+#  Min.   : 1.018    
+#  1st Qu.: 3.879    
+#  Median : 5.790    
+#  Mean   : 8.312    
+#  3rd Qu.: 9.471    
+#  Max.   :59.695
+
+## also use infer workflow to get CI so can report with median
+null_dist_duration <- nyc_bikes_summary %>% 
+  filter(ride_duration_mins <= 60) %>% 
+  specify(response = ride_duration_mins) %>% 
+  generate(reps = 10000, type = "bootstrap") %>% 
+  calculate(stat = "median")
+
+null_dist_duration %>% 
+  get_ci(level = 0.95, type = "percentile")
+
+## For rides of duration 1 hour or less, the median ride duration is 5.79 mins with 95% CI [5.67, 5.93]
+```
+
+```{r}
+# proportion rides less than 10 mins
+nyc_bikes_summary %>% 
+  filter(ride_duration_mins <= 10) %>% 
+  summarise(prop = n()/nrow(nyc_bikes_summary))
+```
+
+
+
+#### ts duration
+
+look at ride duration at different times
+
+```{r}
+nyc_bikes_clean %>%
+  index_by(start_date) %>% 
+  ggplot() + 
+  geom_line(aes(x = start_date, y = ride_duration_mins))
+```
+
+### ts by another factor
+
+https://feasts.tidyverts.org/
+
+```{r}
+# a tsibble needs index and key
+freqs_by_gender <- nyc_bikes_clean %>% 
+  #update_tsibble(key = c(bike_id, gender)) %>% 
+  index_by(start_date) %>%
+  # can group_by variables (any) after indexing
+  group_by(gender) %>%  
+  summarise(freq = n()) %>% 
+  mutate(freq_moving_avg = slide_dbl(
+      .x = freq,
+      .f = ~ mean(., na.rm = TRUE),
+      .before = 10,
+      .after = 10,
+      .complete = TRUE
+    ))
+```
+
+
+```{r}
+freqs_by_gender %>% 
+  ggplot() +
+  geom_line(aes(x = start_date, y = freq, colour = gender)) +
+  scale_colour_manual(values = c(citibank_darkblue, citibank_red, lyft_pink)) +
+  geom_line(aes(x = start_date, y = freq_moving_avg, colour = gender), size = 0.5) +
+  labs(x = "\nStart date", y = "Number of hires\n",
+       title = "Bike hires by gender\n") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        title = element_text(face = "bold"))
+```
+
+```{r}
+freqs_by_type <- nyc_bikes_clean %>% 
+  #update_tsibble(key = c(bike_id, gender)) %>% 
+  index_by(start_date) %>%
+  # can group_by variables (any) after indexing
+  group_by(type) %>%  
+  summarise(freq = n()) %>% 
+  mutate(freq_moving_avg = slide_dbl(
+      .x = freq,
+      .f = ~ mean(., na.rm = TRUE),
+      .before = 10,
+      .after = 10,
+      .complete = TRUE
+    ))
+
+freqs_by_type %>% 
+  ggplot() +
+  geom_line(aes(x = start_date, y = freq, colour = type), alpha = 0.5) +
+  scale_colour_manual(values = c(lyft_pink, citibank_darkblue)) +
+  geom_line(aes(x = start_date, y = freq_moving_avg, colour = type), size = 2) +
+  labs(x = "\nStart date", y = "Number of hires\n",
+       title = "Bike hires by user type\n") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        title = element_text(face = "bold"))
+```
+
+```{r}
+ts_hire_freq_males <- nyc_bikes_clean %>% 
+  filter(gender == "Male") %>% 
+  index_by(start_date) %>% 
+  summarise(freq = n()) %>%
+  mutate(freq_moving_avg = slide_dbl(
+      .x = freq, 
+      .f = ~ mean(., na.rm = TRUE),
+      .before = 10,
+      .after = 10,
+      .complete = TRUE
+    ),
+    gender = "Male")
+
+ts_hire_freq_females <- nyc_bikes_clean %>% 
+  filter(gender == "Female") %>% 
+  index_by(start_date) %>% 
+  summarise(freq = n()) %>%
+  mutate(freq_moving_avg = slide_dbl(
+      .x = freq, 
+      .f = ~ mean(., na.rm = TRUE),
+      .before = 10,
+      .after = 10,
+      .complete = TRUE
+    ),
+    gender = "Female")
+
+
+ts_hire_freq_gender_uk <- nyc_bikes_clean %>% 
+  filter(gender == "Unknown") %>% 
+  index_by(start_date) %>% 
+  summarise(freq = n()) %>%
+  mutate(freq_moving_avg = slide_dbl(
+      .x = freq, 
+      .f = ~ mean(., na.rm = TRUE),
+      .before = 10,
+      .after = 10,
+      .complete = TRUE
+    ),
+    gender = "Unknown")
+```
+
+```{r}
+ts_hire_freq_males %>%
+  ggplot() + 
+  geom_line(aes(x = start_date, y = freq), colour = citibank_red, alpha = 0.5) +
+  geom_line(aes(x = start_date, y = freq_moving_avg), colour = lyft_pink, size = 2) +
+  labs(x = "\nStart date", y = "Number of hires\n",
+       title = "Bike hires by male users\n") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        title = element_text(face = "bold"))
+```
+```{r}
+ts_hire_freq_females %>%
+  ggplot() + 
+  geom_line(aes(x = start_date, y = freq), colour = citibank_darkblue, alpha = 0.5) +
+  geom_line(aes(x = start_date, y = freq_moving_avg), colour = lyft_pink, size = 2) +
+  labs(x = "\nStart date", y = "Number of hires\n",
+       title = "Bike hires by female users\n") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        title = element_text(face = "bold"))
+```
+
+
+```{r}
+hire_freq_rolling <- nyc_bikes_clean %>% 
+  index_by(start_date) %>% 
+  summarise(freq = n()) %>%
+  mutate(freq_moving_avg = slide_dbl(
+      .x = freq, 
+      .f = ~ mean(., na.rm = TRUE),
+      .before = 10,
+      .after = 10,
+      .complete = TRUE
+    ))
+
+hire_freq_rolling %>%
+  ggplot() + 
+  geom_line(aes(x = start_date, y = freq), alpha = 0.5) +
+  geom_line(aes(x = start_date, y = freq_moving_avg), colour = lyft_pink, size = 2) +
+  labs(x = "\nStart date", y = "Number of hires\n",
+       title = "Bike hires throughout the year\n") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        title = element_text(face = "bold"))
+```
+
+
+## 2. Hires by demographics
+
+(see above)
+
+```{r}
+# overall summary counts for user demographics
+
+# (i) gender
+nyc_bikes_summary %>% 
+  summarise(count = n(), .by = gender)
+
+# (ii) age
+nyc_bikes_summary %>% 
+  summarise(count = n(), .by = rider_age) %>% 
+  arrange(rider_age)
+
+# age buckets by years
+nyc_bikes_summary %>% 
+  mutate(rider_age_bucket = case_when(
+    rider_age <= 35 ~ "19-35",
+    rider_age <= 50 ~ "36-50",
+    .default = "51 and above"
+  )) %>% 
+  summarise(count = n(), .by = rider_age_bucket)
+
+# age buckets to even out size of buckets
+nyc_bikes_summary %>% 
+  mutate(rider_age_bucket = case_when(
+    rider_age <= 25 ~ "19-25",
+    rider_age <= 30 ~ "26-30",
+    rider_age <= 35 ~ "31-35",
+    rider_age <= 40 ~ "36-40",
+    rider_age <= 50 ~ "41-50",
+    .default = "51 and above"
+  )) %>% 
+  summarise(count = n(), .by = rider_age_bucket) %>% 
+  arrange(rider_age_bucket)
+
+nyc_bikes_summary %>% 
+  ggplot() +
+  geom_histogram(aes(x = rider_age), colour = "white", bins = 50)
+
+# (iii) user type
+nyc_bikes_summary %>%
+  group_by(type) %>% 
+  summarise(count = n(),
+            prop = count/nrow(nyc_bikes_summary))
+
+# (iv) type by gender
+nyc_bikes_summary %>% 
+  ggplot() +
+  geom_bar(aes(x = gender, fill = type))
+
+# (v) type by age
+nyc_bikes_summary %>% 
+  ggplot() +
+  geom_bar(aes(x = rider_age, fill = type), show.legend = FALSE) +
+  facet_wrap( ~ type, ncol = 1)
+
+nyc_bikes_summary %>% 
+  ggplot() +
+  geom_boxplot(aes(x = rider_age, fill = type))
+
+# (vi) gender by age
+nyc_bikes_summary %>% 
+  ggplot() +
+  geom_bar(aes(x = rider_age, fill = gender), show.legend = FALSE) +
+  facet_wrap( ~ gender, ncol = 1)
+```
+
+* Rider age 26-35 is most frequent user demographics
+* 92.6% of hires are made by subscribers; the customer segment is small
+
+
+#### duration ~ demographic
+
+##### duration ~ gender
+```{r}
+# ride duration by gender
+nyc_bikes_summary %>% 
+  filter(ride_duration_mins <= 60) %>% 
+  filter(gender != "Unknown") %>% 
+  ggplot(aes(x = ride_duration_mins, fill = gender)) +
+  geom_boxplot()
+## doesn't look like there is a difference in duration by gender
+```
+##### ** duration ~ type
+```{r}
+# ride duration by hire type
+nyc_bikes_summary %>% 
+  filter(ride_duration_mins <= 60) %>% 
+  ggplot(aes(x = ride_duration_mins, fill = type)) +
+  geom_boxplot()
+## looks like subscribers take longer bike rides - test this
+```
+2023 website says memberships can hire for 45 minutes then 17c/min charge applies (https://citibikenyc.com/pricing/annual; regardless of bike type); 
+passes hire for 30 mins then 26c/min charge applies (or additional $4 for every 15 mins over - https://citibikenyc.com/how-it-works/bike-rental-nyc).
+
+Might be interesting to calculate income from additional minutes for each type.
+
+
+
+##### *duration ~ age
+
+```{r}
+# rider_age or gender or type ~ ride_duration (time in mins)
+nyc_bikes_summary %>% 
+  filter(rider_age < 100,
+         ride_duration_mins <= 60) %>% 
+  ggplot() +
+  aes(x = rider_age, y = ride_duration_mins) +
+  geom_point()
+
+## no discernible pattern
+## could bucket the duration to see if any differences (e.g. fewer older people take longer rides)
+```
+
+## 3. Geospatial mapping
+
+```{r}
+library(leaflet) # in library calls at top of report
+```
+
+## Start stations (frequency)
+
+_Q: What is the geographical spread of the start points of bike hires?_
+
+```{r}
+# using nyc_bikes_wrangled
+# summary table of start locations by count of unlocks (n) and proportion (% total)
+start_freq <- nyc_bikes_summary %>% 
+  count(start_station, start_long, start_lat) %>% 
+  mutate(popup = str_c("Station: ", start_station,
+                       "; unlock count: ", n),
+         prop_perc = 100*(n/sum(n))) %>% 
+  arrange(desc(prop_perc))
+
+# make df of to 20 most used start stations
+start_freq_top20 <- start_freq %>%
+  head(20)
+
+# make vector of top 20 most used start station IDs 
+start_freq_top20_names <- start_freq_top20 %>% 
+  pull(start_station)
+```
+
+```{r}
+# histogram of all start locations coloured by hire frequency
+start_freq %>% 
+  ggplot() +
+  geom_col(aes(x = n, y = reorder(start_station, n))) +
+  theme_minimal() +
+  labs(x = "Number of unlocks", y = "Start station") +
+  theme(axis.text.y = element_text(size = 6))
+
+# histogram of top 20 locations
+start_freq %>% 
+  slice_max(n, n = 20) %>% 
+  ggplot() +
+  geom_col(aes(x = n, y = reorder(start_station, n))) +
+  theme_minimal() +
+  labs(x = "Number of unlocks", y = "Start station\n") +
+  theme(axis.text.y = element_text(size = 6))
+```
+
+### starts frequency map
+
+```{r}
+# INCLUDE:
+# start_freq <- nyc_bikes_summary %>% 
+#   count(start_station, start_long, start_lat) %>% 
+#   mutate(popup = str_c("Station: ", start_station,
+#                        "; unlock count: ", n),
+#          prop_perc = 100*(n/sum(n))) %>% 
+#   arrange(desc(prop_perc))
+
+# function to colour marker by count (heat intensity)
+palette <- colorNumeric(
+  palette = "plasma",
+  domain = start_freq$n
+)
+
+leaflet(start_freq) %>% 
+  addTiles() %>% 
+  addCircleMarkers(
+    lng = ~start_long,
+    lat = ~start_lat,
+    popup = ~ popup,
+    stroke = TRUE,
+    color = "black",
+    opacity = 1,
+    weight = 3,
+    fillColor = ~ palette(n),
+    fillOpacity = 1,
+    radius = 8
+  )
+```
+
+In 2018, Station 3186 had the most unlocks, busiest pick-up station.
+
+3195 as central coordinates
+
+```{r}
+nyc_bikes_summary %>% 
+  filter(start_station == 3195) %>% 
+  head(1) %>% 
+  select(start_station, start_lat, start_long)
+```
+
+
+### start ~ type of user
+
+```{r}
+starts_by_type <- nyc_bikes_summary %>% 
+  group_by(as.character(start_station), as.character(type)) %>% 
+  summarise(unlocks = n())
+```
+
+Use `forcats` to manipulate factor data and reorder bar chart:
+
+```{r}
+library(forcats)
+```
+
+
+```{r}
+nyc_bikes_summary %>% 
+  # filter for top 20 most used start stations
+  filter(start_station %in% start_freq_top20_names) %>% 
+  ggplot() +
+  geom_bar(aes(y = fct_rev(fct_infreq(start_station)), fill = as.character(type)))
+```
+
+#### [ ] duration ~ start location
+
+
+## Stop stations (frequency)
+
+not explored
+
+
+
+
+
+
+
