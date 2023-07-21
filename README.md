@@ -6,6 +6,12 @@ Coursework and evidence from **NYC Citi bikes project** for SQA PDA in Data Scie
  
 This project was to produce an analytic report containing business insights for a non-technical audience, aimed at business executives involved with the NYC Citibikes scheme. The report, and a presentation of its contents, were produced over 4 days as a solo project for the CodeClan Professional Data Course (July 2023) and as evidence for the PDA qualification.
 
+The recorded presentation can be viewed on YouTube: 
+
+[![Screenshot of video showing report in fullscreen with a bar plot of bike rides by type of user and time of day](images/nyc_bikes_video_barplots.png)](https://youtu.be/q6aq-FXN6to)
+
+The video is ~12 minutes and shows me scrolling through and explaining the .html report included in this repository.
+
 ## About the data
 
 The data used is a time series data frame available from `tsibbledata` package: `nyc_bikes` contains information about 4,268 individual hires of 10 bikes in 2018 as a sample from NYC's Citibikes scheme.
