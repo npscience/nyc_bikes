@@ -1,4 +1,4 @@
-# NYC Citibike
+# NYC Citibikes
  
 Coursework and evidence from **NYC Citi bikes project** for SQA PDA in Data Science.
  
